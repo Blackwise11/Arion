@@ -15,6 +15,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
 
 /**
  * Arion's vessel body — a real, server-side {@link ServerPlayer} the server fully tracks.
@@ -38,6 +39,31 @@ public final class FakeServerPlayer extends ServerPlayer {
      */
     public FakeServerPlayer(MinecraftServer server, ServerLevel level, String name) {
         super(server, level, profileFor(name), ClientInformation.createDefault());
+    }
+
+    /**
+     * Respawn on death instead of lying dead forever. A fake player has no client to click the
+     * "Respawn" button, so without this the dead body would linger: {@code LivingEntity.tickDeath}
+     * removes the <i>entity</i> after 20 ticks but never drops it from the {@code PlayerList}, and a
+     * later {@code ai spawn} (same name → same offline UUID) would collide / stack a second body.
+     *
+     * <p>{@code super.die} plays the death message + drops loot as normal. We then defer a clean
+     * respawn to the next server tick via {@link ServerVesselManager#respawnVessel()}. Deferring is
+     * required: {@code die()} runs inside the damage/tick chain, and respawning mutates the player
+     * list ({@code PlayerList.remove} + {@code placeNewPlayer}) — doing that inline risks a
+     * {@code ConcurrentModificationException}. {@code server.execute} runs the respawn on the server
+     * thread before the next entity-tick pass, safely outside the iteration.
+     *
+     * <p>{@code respawnVessel} guards on {@code !isAlive()}, so if a NeoForge death event cancelled
+     * the death (restoring health), the deferred call is a no-op.
+     */
+    @Override
+    public void die(DamageSource source) {
+        super.die(source);
+        MinecraftServer s = this.level().getServer();
+        if (s != null) {
+            s.execute(() -> ServerVesselManager.get(s).respawnVessel());
+        }
     }
 
     /**

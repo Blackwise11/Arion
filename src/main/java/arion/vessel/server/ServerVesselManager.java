@@ -43,6 +43,9 @@ public final class ServerVesselManager {
 
     private final MinecraftServer server;
     private volatile FakeServerPlayer vessel;
+    private UUID hostUuid;          // the player who owns the vessel (respawn comes back to them)
+    private UUID vesselUuid;        // last vessel's UUID — lets despawn scrub a lingering body even
+                                    // after `this.vessel` has been cleared
 
     private ServerVesselManager(MinecraftServer server) {
         this.server = server;
@@ -76,9 +79,8 @@ public final class ServerVesselManager {
      * {@code ai spawn}). Returns a status message for the host's chat.
      */
     public String spawn(String name, UUID hostPlayerUuid) {
-        // If the previous vessel died, it's still in the PlayerList (a fake player has no client to
-        // request respawn, so it lingers dead). Re-spawning with the same name yields the same offline
-        // UUID → collision. Drop the dead body first so a fresh spawn is clean.
+        // If the previous vessel died and somehow lingered (auto-respawn normally handles death, but
+        // a crash mid-respawn or a pre-respawn-build vessel could leave a dead body), drop it first.
         if (vessel != null && !vessel.isAlive()) {
             try { server.getPlayerList().remove(vessel); } catch (Throwable ignored) {}
             vessel = null;
@@ -89,40 +91,74 @@ public final class ServerVesselManager {
         ServerPlayer host = server.getPlayerList().getPlayer(hostPlayerUuid);
         if (host == null) return "Couldn't find you on the server — try again.";
 
-        ServerLevel level = (ServerLevel) host.level();
-        GameProfile profile = new GameProfile(
-                net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(nameOrArion(name)),
-                nameOrArion(name));
-        FakeServerPlayer fp = new FakeServerPlayer(server, level, name);
+        this.hostUuid = hostPlayerUuid;
+        return createAndRegister(name, (ServerLevel) host.level(), host.position());
+    }
 
-        Vec3 at = host.position();
-        fp.snapTo(at.x, at.y, at.z, host.getYRot(), host.getXRot());
+    /**
+     * Respawn the vessel after death. Called from {@link FakeServerPlayer#die} on the next server
+     * tick (deferred, so we're outside the damage/tick chain). Tears the dead body down fully
+     * (PlayerList + entity) and creates a fresh {@link FakeServerPlayer} at the host's current
+     * position — the companion comes back to you. No-op if the vessel isn't actually dead (e.g. a
+     * NeoForge death event cancelled it) or is already gone.
+     */
+    void respawnVessel() {
+        if (vessel == null || vessel.isAlive()) return;
+        String name = vessel.getGameProfile().name();
+        Vec3 deathPos = vessel.position();
+        UUID deadUuid = vessel.getUUID();
+        arion.Arion.LOGGER.info("[Arion] vessel {} died — respawning at host", name);
+
+        // Tear down the dead body fully. PlayerList.remove untracks the entity + drops the player
+        // list / UUID-map entries; discard() guarantees the entity is gone even if tickDeath hadn't
+        // reached remove(KILLED) yet.
+        try { server.getPlayerList().remove(vessel); } catch (Throwable ignored) {}
+        try { vessel.discard(); } catch (Throwable ignored) {}
+        vessel = null;
+        // Safety net: scrub any same-UUID stragglers before re-creating (same name → same offline
+        // UUID, so a leftover entry would collide / stack a second body).
+        purgeByUuid(deadUuid);
+
+        ServerPlayer host = hostUuid != null ? server.getPlayerList().getPlayer(hostUuid) : null;
+        ServerLevel level = host != null ? (ServerLevel) host.level() : server.overworld();
+        Vec3 at = host != null ? host.position() : deathPos;
+        createAndRegister(name, level, at);
+        if (hostUuid != null) tellHost(server, hostUuid, name + " respawned at your side.");
+    }
+
+    /**
+     * Create + register a fresh vessel named {@code name} at {@code pos} in {@code level}. Shared by
+     * {@link #spawn} and {@link #respawnVessel}. Defensively purges any lingering same-UUID player
+     * first, so the single-vessel invariant holds even if prior state was dirty.
+     */
+    private String createAndRegister(String name, ServerLevel level, Vec3 pos) {
+        String clean = nameOrArion(name);
+        GameProfile profile = new GameProfile(
+                net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(clean), clean);
+        purgeByUuid(profile.id());
+
+        FakeServerPlayer fp = new FakeServerPlayer(server, level, clean);
+        fp.snapTo(pos.x, pos.y, pos.z, 0.0f, 0.0f);
         fp.setOldPosAndRot();
         fp.setHealth(fp.getMaxHealth());
         fp.getFoodData().setFoodLevel(20);
 
-        // Register the vessel as a real player. The fake connection keeps it network-inert; the
-        // server's player tick loop ticks it from here on.
         CommonListenerCookie cookie = new CommonListenerCookie(profile, 0, ClientInformation.createDefault(), false);
         try {
-            server.getPlayerList().placeNewPlayer(new FakeConnection(net.minecraft.network.protocol.PacketFlow.SERVERBOUND), fp, cookie);
+            server.getPlayerList().placeNewPlayer(
+                    new FakeConnection(net.minecraft.network.protocol.PacketFlow.SERVERBOUND), fp, cookie);
         } catch (Throwable t) {
             arion.Arion.LOGGER.warn("ServerVesselManager: placeNewPlayer failed: {}", t.toString());
             try { fp.discard(); } catch (Throwable ignored) {}
             return "Couldn't spawn the vessel: " + t;
         }
 
-        // The vessel has no client to send the "finished loading" ack, so it would sit in the
-        // server's client-load-wait limbo (which gates some behaviour and eventually tries to
-        // disconnect — already neutralised in FakeConnection). Confirm load now so the server
-        // treats it as a fully-joined player.
         try { fp.connection.markClientLoaded(); } catch (Throwable ignored) {}
 
         // Force SURVIVAL. placeNewPlayer inherits the world's default game type (ServerPlayer ctor →
         // calculateGameModeForNewPlayer), so on a creative world the vessel would spawn creative →
         // abilities.invulnerable=true → Player.hurtServer returns false for ALL melee damage. Survival
-        // clears that flag so the vessel is genuinely damageable. A companion that can't be hurt can't
-        // fight or be fought.
+        // clears that flag so the vessel is genuinely damageable.
         try {
             fp.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
             fp.getAbilities().invulnerable = false;   // belt-and-suspenders; survival already clears it
@@ -132,18 +168,38 @@ public final class ServerVesselManager {
         }
 
         this.vessel = fp;
-        return "Summoned " + nameOrArion(name) + " (server-side, survival). Mobs can see it; it takes real damage.";
+        this.vesselUuid = profile.id();
+        return "Summoned " + clean + " (server-side, survival). Mobs can see it; it takes real damage.";
     }
 
-    /** Remove the vessel from the server. */
+    /**
+     * Remove every player whose UUID matches {@code uuid} from the PlayerList + level. The host's
+     * real UUID never equals the vessel's offline UUID, so the host is never touched. Idempotent.
+     * This is the single-vessel safety net: even if a dead body lingered or a spawn raced, there's
+     * never more than one Arion.
+     */
+    private void purgeByUuid(UUID uuid) {
+        if (uuid == null) return;
+        PlayerList pl = server.getPlayerList();
+        for (ServerPlayer p : new java.util.ArrayList<>(pl.getPlayers())) {
+            if (p.getUUID().equals(uuid)) {
+                try { pl.remove(p); } catch (Throwable ignored) {}
+                try { p.discard(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /** Remove the vessel from the server. Also scrubs any lingering same-UUID body. */
     public String despawn() {
-        if (vessel == null) return "No vessel is active.";
-        String name = vessel.getGameProfile().name();
-        try {
-            server.getPlayerList().remove(vessel);
-        } catch (Throwable ignored) {}
-        try { vessel.discard(); } catch (Throwable ignored) {}
-        vessel = null;
+        UUID uuid = vessel != null ? vessel.getUUID() : vesselUuid;
+        if (uuid == null) return "No vessel is active.";
+        String name = vessel != null ? vessel.getGameProfile().name() : "Vessel";
+        if (vessel != null) {
+            try { server.getPlayerList().remove(vessel); } catch (Throwable ignored) {}
+            try { vessel.discard(); } catch (Throwable ignored) {}
+            vessel = null;
+        }
+        purgeByUuid(uuid);   // scrub any lingering body (e.g. a dead one this.vessel lost track of)
         return name + " despawned.";
     }
 
