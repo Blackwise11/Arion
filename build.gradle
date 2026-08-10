@@ -1,0 +1,88 @@
+/*
+ * Arion — an AI companion mod that REQUIRES Baritone.
+ *
+ * Arion is a standalone mod, NOT part of Baritone and NOT a Baritone improvement.
+ * It drives Baritone's public API (the interfaces in libs/baritone-api-neoforge-*.jar)
+ * as its "body"; the real Baritone mod must be installed at runtime.
+ */
+
+plugins {
+    id 'java'
+    id "xyz.wagyourtail.unimined"
+}
+
+base {
+    archivesName = project.archives_base_name
+}
+
+version = project.mod_version
+group = project.maven_group
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(project.java_version.toInteger()))
+    }
+}
+
+repositories {
+    mavenCentral()
+    // Simple Voice Chat plugin API (optional, compile-only — graceful fallback at runtime)
+    maven { url = 'https://maven.maxhenkel.de/repository/public' }
+}
+
+unimined.minecraft(sourceSets.main) {
+    version project.minecraft_version
+
+    mappings {
+        mojmap()
+    }
+
+    neoForge {
+        loader project.neoforge_version
+        // Arion has no mixins of its own; Baritone ships its own.
+    }
+
+    minecraftRemapper.config {
+        ignoreConflicts(true)
+    }
+}
+
+configurations {
+    baritoneApi
+    voicechatApi
+    compileClasspath.extendsFrom baritoneApi
+    compileClasspath.extendsFrom voicechatApi
+}
+
+dependencies {
+    // Interfaces only, provided at runtime by the standalone Baritone mod jar.
+    baritoneApi files("libs/baritone-api-neoforge-1.15.0-9-g698450b0-dirty.jar")
+
+    // Simple Voice Chat plugin API. compileOnly: Arion must still load and run
+    // (text-only) when SVC isn't installed, so this is never bundled.
+    voicechatApi "de.maxhenkel.voicechat:voicechat-api:${project.voicechat_api_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("META-INF/neoforge.mods.toml") {
+        expand "version": project.version
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+                'Implementation-Title': 'Arion',
+                'Implementation-Version': project.version,
+        )
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    if (JavaVersion.current().isJava9Compatible()) {
+        it.options.release = project.java_version.toInteger()
+    }
+}

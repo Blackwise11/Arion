@@ -1,0 +1,37 @@
+# Build / Gradle artifacts
+build/
+.gradle/
+bin/
+out/
+
+# Plan / internal dev docs — not for the public repo
+plan/
+
+# Stray decompiled class-inspection artifacts (not Arion source)
+baritone/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.eclipse/
+.classpath
+.project
+.settings/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs / dev runtime output
+*.log
+logs/
+crash-reports/
+run/
+run-data/
+
+# Runtime config — may contain BYOK API keys. NEVER commit.
+config/arion-client.toml

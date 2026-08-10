@@ -1,0 +1,36 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="LGPL-3.0"
+issueTrackerURL="https://github.com/cabaletta/baritone/issues"
+
+[[mods]]
+modId="arion"
+version="${version}"
+displayName="Arion"
+displayURL="https://github.com/cabaletta/baritone"
+authors="you"
+description='''An AI companion that plays alongside you, using Baritone as its hands and feet.'''
+
+# Arion REQUIRES Baritone. It will not load without it.
+[[dependencies.arion]]
+modId="baritoe"
+type="required"
+versionRange="[0,)"
+ordering="AFTER"
+side="CLIENT"
+
+[[dependencies.arion]]
+modId="minecraft"
+type="required"
+versionRange="[26.1, 26.1.2]"
+ordering="NONE"
+side="CLIENT"
+
+# Simple Voice Chat is OPTIONAL: Arion runs text-only without it, and uses it as
+# the mic/voice front-end when present.
+[[dependencies.arion]]
+modId="voicechat"
+type="optional"
+versionRange="[0,)"
+ordering="AFTER"
+side="CLIENT"

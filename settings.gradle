@@ -1,0 +1,46 @@
+pluginManagement {
+    repositories {
+        mavenLocal()
+        maven {
+            name = 'WagYourMaven'
+            url = 'https://maven.wagyourtail.xyz/snapshots'
+        }
+        maven {
+            name = 'WagYourMaven Releases'
+            url = 'https://maven.wagyourtail.xyz/releases'
+        }
+        maven {
+            name = 'ForgeMaven'
+            url = 'https://maven.minecraftforge.net/'
+        }
+        maven {
+            name = 'FabricMaven'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven {
+            name = 'NeoForgedMaven'
+            url = 'https://maven.neoforged.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal() {
+            content {
+                excludeGroup "org.apache.logging.log4j"
+            }
+        }
+    }
+    resolutionStrategy {
+        eachPlugin {
+            // Unimined is declared without a version in build.gradle; resolve it here,
+            // matching the version Baritone uses.
+            if (requested.id.id == 'xyz.wagyourtail.unimined') {
+                useModule('xyz.wagyourtail.unimined:xyz.wagyourtail.unimined.gradle.plugin:1.4.2-SNAPSHOT')
+            }
+        }
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+
+rootProject.name = 'arion'
