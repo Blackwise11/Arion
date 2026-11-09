@@ -59,6 +59,8 @@ public final class ArionBrain {
         List<Message> messages = new ArrayList<>();
         messages.add(Message.system(systemPrompt()));
         messages.add(Message.user("World state:\n" + worldSnapshot + "\n\nPlayer says: " + playerMessage));
+        // log the user-side prompt only (messages carry no API key — the key lives on AiRequest)
+        arion.ArionLog.trace("LLM request: " + playerMessage);
 
         AiProvider reflex = registry.byIdOrDefault(config.reflexProvider.get());
         AiRequest req = new AiRequest(
@@ -101,9 +103,88 @@ public final class ArionBrain {
                 .exceptionally(t -> "❌ " + rootMessage(t));
     }
 
+    /**
+     * System 2 macro planner. Asks the configured planner for a strict JSON plan
+     * (AGENTS.md §4.1) that {@code ProcessTracker} can execute one step at a time
+     * while Laya picks the atomic actions.
+     *
+     * <p>Returns the raw reply; the caller parses it so a malformed plan is reported
+     * as "planner returned unusable JSON" instead of silently becoming chat text.
+     * Terminates exceptionally on provider errors — the caller must attach
+     * {@code .exceptionally(...)} before dropping the future.
+     */
+    public CompletableFuture<String> planSteps(String goal, String worldSnapshot) {
+        List<Message> messages = new ArrayList<>();
+        messages.add(Message.system(planSystemPrompt()));
+        messages.addAll(memory.recent());
+        messages.add(Message.user("World state:\n" + worldSnapshot + "\n\nGoal: " + goal));
+        arion.ArionLog.debug("planner(planSteps) → " + config.plannerProvider.get()
+                + "/" + config.plannerModel.get());
+
+        AiProvider planner = registry.byIdOrDefault(config.plannerProvider.get());
+        AiRequest req = new AiRequest(
+                config.plannerBaseUrl.get(),
+                config.plannerModel.get(),
+                config.plannerApiKey.get(),
+                messages,
+                config.plannerTimeoutSeconds.get()
+        );
+        return planner.complete(req);
+    }
+
+    /**
+     * The strict plan schema. The planner is a chat model, not a JSON-mode endpoint, so the
+     * prompt repeats the "only JSON" rule and gives one valid example.
+     */
+    private static String planSystemPrompt() {
+        return """
+                You are Arion, the System 2 macro planner for a Minecraft companion that must
+                progress from spawn to defeating the Ender Dragon.
+
+                Break the goal into a short sequence of concrete steps. Reply with ONLY a JSON
+                object — no prose, no markdown fences.
+
+                Schema:
+                {"goal":"<string>","total_steps":<int>,"steps":[
+                  {"step_id":<int>,
+                   "objective":"<gather|craft|smelt|explore|hunt>",
+                   "target":"<item_or_block_identifier>",
+                   "amount":<int>,
+                   "exit_condition":"<expression_evaluable_by_perception>"}
+                ]}
+
+                Rules:
+                - 3 to 12 steps, ordered. Use minecraft ids for targets (e.g. "minecraft:iron_ore").
+                - The LAST step MUST produce the goal item itself. Never end the plan at an
+                  intermediate ingredient: for "get an iron pickaxe", the final step is
+                  craft minecraft:iron_pickaxe, not smelt minecraft:iron_ingot.
+                - Targets are the items the bot should END UP with (e.g. cobblestone, raw_iron);
+                  Arion maps them to the correct block to mine. Do not repeat the same
+                  target/amount in consecutive steps.
+                - If the goal only asks to collect/gather items, use only gather/explore/hunt steps;
+                  do not invent crafting or smelting steps the goal did not ask for.
+                - objective=gather: mine or collect `amount` of target.
+                - A tool needed to harvest a target must be crafted BEFORE that gather step:
+                  stone_pickaxe before iron_ore/raw_iron, iron_pickaxe before diamond_ore/diamond,
+                  wooden_pickaxe before stone/cobblestone. Never put the gather step before its tool.
+                - Do not put an explore step before a gather/mine step: Baritone's mining action
+                  searches for and paths to the target itself. Use explore only when the resource
+                  is genuinely unknown or the bot is lost.
+                - objective=craft/smelt: produce `amount` of target at a crafting table / furnace.
+                - objective=explore: target "" and amount 0; move outward to find resources.
+                - objective=hunt: target is a mob name (e.g. "zombie") and amount is how many.
+                - exit_condition must be short and checkable from the body status, e.g.
+                  "inventory:minecraft:raw_iron >= 24" or "at y <= 12 and has iron_pickaxe".
+                - Only plan what is achievable with the current body, tools, and inventory shown
+                  in the world state. Do not repeat steps that are already complete.
+                """;
+    }
+
     /** Parse the model's reply into a structured action. Tolerant of junk output. */
     static ArionAction parseAction(String reply) {
+        arion.ArionLog.trace("LLM reply: " + reply);
         if (reply == null || reply.isBlank()) {
+            arion.ArionLog.debug("LLM reply not JSON → chat fallback (blank)");
             return ArionAction.chat("(no response)");
         }
         // try to pull the first {...} JSON object out of the reply
@@ -111,6 +192,7 @@ public final class ArionBrain {
         int end = reply.lastIndexOf('}');
         if (start < 0 || end <= start) {
             // model didn't return JSON — just relay what it said
+            arion.ArionLog.debug("LLM reply not JSON → chat fallback (no braces)");
             return ArionAction.chat(reply.trim());
         }
         try {
@@ -118,8 +200,10 @@ public final class ArionBrain {
             String verb = o.has("action") ? o.get("action").getAsString().toLowerCase() : "chat";
             String arg  = o.has("arg") ? o.get("arg").getAsString() : "";
             String say  = o.has("say") ? o.get("say").getAsString() : "";
+            arion.ArionLog.debug("parsed action: verb=" + verb + " arg=\"" + arg + "\" say=\"" + say + "\"");
             return new ArionAction(verb, arg, say);
         } catch (Exception e) {
+            arion.ArionLog.debug("LLM reply not JSON → chat fallback (parse error: " + rootMessage(e) + ")");
             return ArionAction.chat(reply.trim());
         }
     }

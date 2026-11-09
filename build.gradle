@@ -55,8 +55,10 @@ configurations {
 }
 
 dependencies {
-    // Interfaces only, provided at runtime by the standalone Baritone mod jar.
-    baritoneApi files("libs/baritone-api-neoforge-1.15.0-9-g698450b0-dirty.jar")
+    // Interfaces only, provided at runtime by the Baritone mod jar.
+    // NOTE: keep this filename in sync with baritone/dist after rebuilding the fork (the version
+    // string comes from `git describe` and changes on every commit).
+    baritoneApi files("libs/baritone-api-neoforge-1.15.0-10-gd26d7aa6-dirty.jar")
 
     // Simple Voice Chat plugin API. compileOnly: Arion must still load and run
     // (text-only) when SVC isn't installed, so this is never bundled.

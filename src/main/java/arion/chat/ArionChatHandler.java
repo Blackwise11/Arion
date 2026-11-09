@@ -45,9 +45,21 @@ public final class ArionChatHandler {
         event.setCanceled(true);
         String command = raw.substring(prefix.length()).trim();
         if (command.isEmpty()) return;
+        arion.ArionLog.debug("chat → \"" + command + "\"");
 
         IBaritone baritone = arion.Arion.baritone();
-        if (baritone == null) return;
+        if (baritone == null) {
+            // previously a silent drop — tell the player + log it
+            arion.ArionLog.debug("chat: no Baritone available — dropped");
+            net.minecraft.client.Minecraft.getInstance().execute(() -> {
+                var p = net.minecraft.client.Minecraft.getInstance().player;
+                if (p != null) {
+                    p.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+                            "[Arion] Baritone isn't ready yet — try again in a moment."));
+                }
+            });
+            return;
+        }
         controller.onPlayerCommand(baritone, command);
     }
 }

@@ -11,89 +11,88 @@ package arion.vessel;
 
 import baritone.api.IBaritone;
 import baritone.api.utils.IPlayerContext;
-
-import java.lang.reflect.Field;
+import baritone.api.utils.IPlayerController;
+import net.minecraft.client.player.LocalPlayer;
 
 /**
- * Borrows the <b>primary</b> Baritone for the vessel, then returns it on despawn.
+ * Binds the primary Baritone to the vessel's client-side shadow, and unbinds it on despawn.
  *
- * Why borrow the primary (not create a fresh instance): Baritone's
- * {@code IBaritoneProvider.createBaritone(Minecraft)} is keyed by the single
- * {@code Minecraft} instance — it returns the already-registered primary baritone,
- * never a new one. There is no API to create a second Baritone for a different
- * {@code LocalPlayer}. So the vessel reuses the primary baritone for the duration it
- * is spawned: we reflectively swap the primary's private-final {@code playerContext}
- * for a {@link VesselPlayerContext} (whose {@code player()} is the vessel and whose
- * {@code playerController()} is a {@link NoopPlayerController}), and on despawn we
- * swap the original context back.
+ * <p><b>Why we redirect the context instead of swapping {@code Baritone.playerContext}:</b>
+ * Baritone constructs every behavior and process with the single {@link IPlayerContext}
+ * instance created in its constructor ({@code Behavior.ctx}, {@code BaritoneProcessHelper.ctx},
+ * the block break/place helpers, …). Reflecting a new context into the {@code playerContext}
+ * field changes what {@code getPlayerContext()} returns — which is enough for the mixin gate
+ * that stops the host from being driven — but all of those cached references still resolve
+ * {@code player()} to the host. The engine therefore plans from the host's position while the
+ * forced inputs are forwarded to the vessel: {@code ai vessel come} sets a goal at the host's
+ * own feet (already satisfied), {@code follow} follows the host (already there), and nothing
+ * moves.
  *
- * While borrowed, the real player cannot use their own Baritone — that is the
- * documented trade-off of this approach. {@code getBaritoneForPlayer(mc.player)}
- * returns null while the primary's context points at the vessel, so Baritone's
- * input-forcing mixins never fire against {@code mc.player} (no packets from your
- * account). The vessel body is driven purely by {@link FakePlayerManager} copying the
- * primary's forced inputs into the vessel's no-network tick.
+ * <p>The fork exposes {@link IPlayerContext#setPlayerOverride(LocalPlayer)} and
+ * {@link IPlayerContext#setPlayerControllerOverride(IPlayerController)}. Both redirect the one
+ * shared context instance, so everything that already holds it — pathing, look, inventory,
+ * every {@code IBaritoneProcess} — follows automatically. Clearing the overrides restores the
+ * real player without touching the host's identity.
  *
- * The wrapper's {@code playerController()} is a no-op, so Baritone can pathfind and
- * move the vessel but <b>cannot emit a break/place/attack packet</b>. We do NOT touch
- * the original context's {@code playerController} field — doing so would destroy the
- * real player's controller and make clean restoration impossible. The wrapper override
- * is sufficient.
- *
- * If any reflection step fails, {@link #bind} returns {@code null} and leaves the
- * primary baritone unmodified (the vessel falls back to seek-only).
+ * <p>If any step fails, the overrides are cleared and {@link #bind} returns {@code null}; the
+ * primary Baritone is left exactly as it was (the vessel then falls back to straight-line seek).
  */
 final class VesselBaritoneBinder {
 
     private VesselBaritoneBinder() {}
 
     /**
-     * Borrow {@code primary} for {@code vessel}. Returns the original
-     * {@link IPlayerContext} (to be passed back to {@link #unbind} on despawn), or
-     * {@code null} on any reflection failure — in which case the baritone is untouched.
+     * Redirect {@code primary}'s player context to {@code vessel} + {@code controller}.
+     *
+     * @return the redirected context (pass it back to {@link #unbind} on despawn), or
+     *         {@code null} on failure — in which case the primary is untouched.
      */
-    static IPlayerContext bind(IBaritone primary, FakePlayerEntity vessel) {
+    static IPlayerContext bind(IBaritone primary, FakePlayerEntity vessel, IPlayerController controller) {
+        if (primary == null || vessel == null || controller == null) return null;
         try {
-            Field pcField = findField(primary.getClass(), "playerContext");
-            pcField.setAccessible(true);
-            Object originalCtx = pcField.get(primary);
-            if (!(originalCtx instanceof IPlayerContext)) {
-                arion.Arion.LOGGER.warn("VesselBaritoneBinder: playerContext is not an IPlayerContext.");
+            IPlayerContext ctx = primary.getPlayerContext();
+            if (ctx == null) {
+                arion.Arion.LOGGER.warn("VesselBaritoneBinder: primary has no player context yet.");
                 return null;
             }
-            IPlayerContext original = (IPlayerContext) originalCtx;
 
-            // swap in the vessel-bound wrapper as the primary's playerContext
-            VesselPlayerContext wrapper = new VesselPlayerContext(vessel, original);
-            pcField.set(primary, wrapper);
-            return original;
+            ctx.setPlayerControllerOverride(controller);
+            ctx.setPlayerOverride(vessel);
+
+            // Self-verify: this is the instance every behavior/process cached at construction,
+            // so if it reports the vessel here, pathing/look/combat all operate on the vessel.
+            // If not, fail loudly and revert rather than silently driving the host.
+            if (ctx.player() != vessel) {
+                LocalPlayer actual = ctx.player();
+                arion.Arion.LOGGER.error("[Arion] VesselBaritoneBinder: player override did not take "
+                                + "(context.player() is {}, expected the vessel shadow). Reverting; host untouched.",
+                        actual == null ? "null" : actual.getName().getString());
+                unbind(primary, ctx);
+                return null;
+            }
+            if (ctx.playerController() != controller) {
+                arion.Arion.LOGGER.error("[Arion] VesselBaritoneBinder: controller override did not take. "
+                        + "Reverting; host untouched.");
+                unbind(primary, ctx);
+                return null;
+            }
+
+            arion.Arion.LOGGER.info("[Arion] VesselBaritoneBinder: primary playerContext redirected to the vessel shadow.");
+            return ctx;
         } catch (Throwable t) {
-            arion.Arion.LOGGER.warn("VesselBaritoneBinder: couldn't borrow the primary Baritone: {}", t.toString());
+            arion.Arion.LOGGER.warn("VesselBaritoneBinder: couldn't bind the primary Baritone: {}", t.toString());
             return null;
         }
     }
 
-    /** Return {@code primary} to the real player by restoring the saved context. */
-    static void unbind(IBaritone primary, IPlayerContext original) {
-        if (primary == null || original == null) return;
+    /** Clear the redirect so the host's real player and controller become visible again. */
+    static void unbind(IBaritone primary, IPlayerContext boundContext) {
+        if (boundContext == null) return;
         try {
-            Field pcField = findField(primary.getClass(), "playerContext");
-            pcField.setAccessible(true);
-            pcField.set(primary, original);
+            boundContext.setPlayerOverride(null);
+            boundContext.setPlayerControllerOverride(null);
         } catch (Throwable t) {
             arion.Arion.LOGGER.warn("VesselBaritoneBinder: couldn't restore the primary Baritone: {}", t.toString());
         }
-    }
-
-    private static Field findField(Class<?> cls, String name) throws NoSuchFieldException {
-        Class<?> c = cls;
-        while (c != null) {
-            try {
-                return c.getDeclaredField(name);
-            } catch (NoSuchFieldException e) {
-                c = c.getSuperclass();
-            }
-        }
-        throw new NoSuchFieldException(name);
     }
 }

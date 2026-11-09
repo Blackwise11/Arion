@@ -53,6 +53,10 @@ public class FakePlayerEntity extends LocalPlayer {
     /** Negative ids, counting down, so we never collide with server-assigned ids. */
     private static final AtomicInteger NEXT_ID = new AtomicInteger(-1_000_000);
 
+    /** Body-mirrored attack charge (see {@link #syncAttackStrength(int, float)}). */
+    private float syncedAttackScale = 1.0f;
+    private boolean hasSyncedAttackStrength;
+
     // ---- Baritone-driven movement input (filled by FakePlayerManager each tick) ----
     private boolean moveForward, moveBack, moveLeft, moveRight;
     private boolean wantsJump, wantsSneak, wantsSprint;
@@ -61,6 +65,13 @@ public class FakePlayerEntity extends LocalPlayer {
     private double seekX, seekY, seekZ;
     private boolean seeking = false;
     private static final double SEEK_SPEED = 0.215;
+
+    // ---- shadow mode (Phase C / M2): a position-feeder for the primary Baritone ----
+    // When shadowMode is true this entity is NOT ticked physically. It exists only so Baritone's
+    // IPlayerContext.player() returns a LocalPlayer whose position/rotation mirror the server-side
+    // vessel — Baritone pathfinds from there. FakePlayerManager sets the position each tick via
+    // syncFrom(); tick()/aiStep() are no-ops. The shadow is invisible and never added to the level.
+    private boolean shadowMode = false;
 
     public FakePlayerEntity(Minecraft mc, ClientLevel level, ClientPacketListener connection,
                             GameProfile profile) {
@@ -73,6 +84,97 @@ public class FakePlayerEntity extends LocalPlayer {
         setId(NEXT_ID.getAndDecrement());
         // a private input holder so nothing reads the real keyboard for this player
         this.input = new net.minecraft.client.player.ClientInput();
+    }
+
+    /**
+     * Switch this entity into a Baritone shadow: invisible, non-physical, position set externally.
+     * The server-side vessel is the real body; this LocalPlayer only exists so Baritone (which
+     * requires a LocalPlayer in its context) can read a position + world to pathfind against.
+     */
+    public void enableShadowMode() {
+        this.shadowMode = true;
+        this.seeking = false;
+        this.setInvisible(true);
+        this.noPhysics = true;
+        // a unique, non-colliding UUID — the shadow is never added to the level, but set one so
+        // nothing can mistake it for the real player or the vessel.
+        try { this.setUUID(java.util.UUID.randomUUID()); } catch (Throwable ignored) {}
+    }
+
+    public boolean isShadow() { return shadowMode; }
+
+    /**
+     * Advance the vanilla attack-strength ticker that a shadow never gets.
+     *
+     * <p>A shadow is a pure position feeder: {@link #tick()} returns immediately in shadow mode, so
+     * {@code Player.tick()} — which normally does {@code attackStrengthTicker++} every tick — never
+     * runs and {@link #getAttackStrengthScale(float)} stays pinned near 0. Baritone's
+     * {@code CombatProcess} refuses to melee while {@code getAttackStrengthScale(0.5f) < 0.9f}
+     * (the {@code combatHumanizeAim} gate, on by default), so without this the borrowed Baritone
+     * would walk the vessel up to a mob and never swing: the vessel-bound controller's
+     * {@code attack(...)} would never be called.
+     *
+     * <p>Called once per client tick by {@code FakePlayerManager} (mirrors vanilla's increment).
+     */
+    public void tickAttackStrength() {
+        this.attackStrengthTicker++;
+    }
+
+    /**
+     * Mirror the server body's real attack charge. Called on the client thread every tick by
+     * {@link arion.vessel.FakePlayerManager}.
+     *
+     * <p>Both values are authoritative for the body: {@code ticker} feeds anything that reads the
+     * raw counter, and {@code scale} is what Baritone's {@code getAttackStrengthScale() >= 0.9}
+     * gate actually consumes. Mirroring the scale matters because the shadow never ticks: its own
+     * ATTACK_SPEED attribute modifiers (from the held sword) are never refreshed, so a locally
+     * computed scale would reach 0.9 far too early and the vessel would spam swings.
+     */
+    public void syncAttackStrength(int ticker, float scale) {
+        this.attackStrengthTicker = Math.max(0, ticker);
+        this.syncedAttackScale = Math.max(0.0f, Math.min(1.0f, scale));
+        this.hasSyncedAttackStrength = true;
+    }
+
+    /** Body-authoritative while the bridge is live; vanilla math as a fallback. */
+    @Override
+    public float getAttackStrengthScale(float adjustTicks) {
+        return this.hasSyncedAttackStrength
+                ? this.syncedAttackScale
+                : super.getAttackStrengthScale(adjustTicks);
+    }
+
+    /**
+     * Initial placement: position + facing. Used once at spawn, before Baritone drives the
+     * shadow. Do <b>not</b> use this per tick — Baritone owns the shadow's rotation while it
+     * drives (see the per-tick overload).
+     */
+    public void syncFrom(double x, double y, double z, float yRot) {
+        // setPosRaw + setYRot to avoid triggering movement/collision logic on a non-physical entity
+        this.setPosRaw(x, y, z);
+        this.setYRot(yRot);
+        this.setYHeadRot(yRot);
+        this.xOld = x; this.yOld = y; this.zOld = z;   // suppress interp jitter
+        this.setOnGround(true);
+    }
+
+    /**
+     * Per-tick mirror from the server vessel's client-visible {@code RemotePlayer}.
+     *
+     * <p><b>Deliberately does not copy yaw/pitch.</b> Baritone aims the shadow through
+     * {@code LookBehavior}/{@code MovementHelper} and Arion forwards {@code shadow.getYRot()} to
+     * the server body. Copying the body's yaw back into the shadow every tick creates a feedback
+     * loop — the body's old yaw overwrites Baritone's new aim before it is forwarded — so the
+     * body only ever walks in its initial direction ("moves forward but never turns").
+     *
+     * <p>{@code onGround} and {@code deltaMovement} are mirrored because pathing reads them when
+     * reconciling a start position; they do not make the shadow physical.
+     */
+    public void syncFrom(double x, double y, double z, boolean onGround, Vec3 deltaMovement) {
+        this.setPosRaw(x, y, z);
+        this.xOld = x; this.yOld = y; this.zOld = z;   // suppress interp jitter
+        this.setOnGround(onGround);
+        if (deltaMovement != null) this.setDeltaMovement(deltaMovement);
     }
 
     /** Update the movement inputs Baritone wants this tick. Called by FakePlayerManager. */
@@ -112,6 +214,7 @@ public class FakePlayerEntity extends LocalPlayer {
      */
     @Override
     public void tick() {
+        if (shadowMode) return; // shadow is a pure position-feeder; no physics, no network
         // baseTick() = Entity-level tick (riding, portal, fire, position history) — no
         // network. We deliberately do NOT call LocalPlayer.tick()/AbstractClientPlayer.tick().
         this.baseTick();

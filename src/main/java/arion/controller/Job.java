@@ -50,6 +50,18 @@ public abstract class Job {
      */
     protected abstract double progressDistance(IPlayerContext ctx);
 
+    /**
+     * Whether a Baritone {@code CALC_FAILED} path event should fail this job immediately.
+     *
+     * <p>Mining / exploring / pickup processes handle calc failures internally: they blacklist
+     * the closest unreachable target and retry. Killing the job on the first CALC_FAILED makes an
+     * otherwise workable mine look broken after one bad path (the exact "mine stone → FAILED after
+     * 2 s, three times" loop in the live log).
+     */
+    boolean calcFailureIsFatal() {
+        return true;
+    }
+
     /** @return true if the underlying Baritone process is still running. */
     protected abstract boolean baritoneActive(IBaritone baritone);
 
@@ -67,11 +79,13 @@ public abstract class Job {
 
         // natural completion: baritone gave up control without an error
         if (!baritoneActive(baritone)) {
+            arion.ArionLog.debug("job " + label + " → DONE");
             return finish(JobResult.DONE);
         }
 
         // timeout failsafe
         if (timeoutTicks > 0 && ageTicks > timeoutTicks) {
+            arion.ArionLog.debug("job " + label + " → TIMEOUT");
             cancel(baritone);
             return finish(JobResult.TIMEOUT);
         }
@@ -85,6 +99,7 @@ public abstract class Job {
             } else {
                 ticksSinceProgress++;
                 if (ticksSinceProgress > stallTicks) {
+                    arion.ArionLog.debug("job " + label + " → STUCK");
                     cancel(baritone);
                     return finish(JobResult.STUCK);
                 }

@@ -46,6 +46,12 @@ public final class CombatController {
     private static final double SCAN_RANGE = 32.0;
     private static final double PURSUE_RANGE = 64.0;
 
+    // --- threat detection (client-side; see isHostile — NOT getTarget()-based) ---
+    private static final double MELEE_THREAT = 2.5;    // a hostile this close is about to swing
+    private static final double REACTION_RANGE = 8.0;  // notice closing threats within this
+    private static final double SWAP_MARGIN = 0.5;     // hysteresis: don't jitter between near-equidistant mobs
+    private static final int SWARM_KITE_THRESHOLD = 2; // ≥2 hostiles in melee → kite, don't stand and trade
+
     private final ArionConfig config;
 
     private State state = State.IDLE;
@@ -158,12 +164,18 @@ public final class CombatController {
 
     /** Clear all state on world unload / disconnect. Always restores reach. */
     public void reset(IPlayerContext ctx) {
+        boolean wasActive = isActive();
         setState(State.IDLE);
         target = null;
         filter = null;
         lastGoalPos = null;
         searchAnchor = null;
         restoreReach(ctx);
+        // a reset mid-hunt used to end silently — fire the listener so the brain learns
+        // the hunt stopped. "world unloaded" is NOT a re-ask trigger (see ArionController).
+        if (wasActive) {
+            fireHuntEnded("world unloaded");
+        }
     }
 
     // ------------------------------------------------------------- main loop
@@ -179,15 +191,59 @@ public final class CombatController {
             enterRetreat(baritone, ctx);
             return;
         }
-        int attackers = countAttackers(ctx);
+        int attackers = countNearbyHostiles(ctx, REACTION_RANGE);
+        debug("attackers=" + attackers);
         if (attackers > config.combatMaxAttackers.get()) {
             enterRetreat(baritone, ctx);
             return;
         }
 
+        // ---- defensive reflex: re-target the nearest hostile threatening us ----
+        // The main loop locks onto one target and then ignores everything else, so a
+        // second mob walking up to swing would land free hits while we keep whaling on
+        // the first. Every tick, re-evaluate the nearest HOSTILE within reaction range
+        // (any hostile, not just hunt-filter prey — a skeleton shooting you while you
+        // hunt zombies is a threat). Swap to it when it's in our face (about to swing)
+        // while our locked target isn't, or when it's meaningfully closer (hysteresis
+        // so we don't flicker between two near-equidistant mobs).
+        //
+        // NOTE: this is NOT getTarget()-based. Mob.target isn't synced to the client
+        // (vanilla), so mob.getTarget() is null on the client — the old nearestThreat /
+        // countAttackers / isAttackingMe were dead code. We detect threats by hostile
+        // type + proximity instead. See isHostile().
+        //
+        // The reflex ONLY re-targets (sets target/tactic/lastGoalPos); it does not force
+        // setState(STRIKE). The state handlers act on the new target naturally: doApproach
+        // self-flips to STRIKE when the new target is in reach; doStrike/doRecover keep
+        // swinging/kiting it. Forcing STRIKE here fought the swarm kite in RECOVER.
+        LivingEntity threat = nearestHostile(ctx, REACTION_RANGE);
+        if (threat != null && threat != target) {
+            double threatDist = threat.distanceToSqr(player);
+            boolean threatInMelee = threatDist <= MELEE_THREAT * MELEE_THREAT;
+            boolean currentInMelee = target != null
+                    && target.distanceToSqr(player) <= MELEE_THREAT * MELEE_THREAT;
+            boolean threatCloser = target == null
+                    || threatDist < target.distanceToSqr(player) - SWAP_MARGIN * SWAP_MARGIN;
+            if ((threatInMelee && !currentInMelee) || threatCloser) {
+                target = threat;
+                tactic = MobTactic.forEntity(threat);
+                lastGoalPos = null;
+                equipBestWeapon(ctx);
+                applyReachBuff(ctx);
+                debug("threat! " + threat.getName().getString()
+                        + " — re-targeted (melee=" + threatInMelee + ", state=" + state + ")");
+                // break out of SEARCH/ACQUIRE so we engage the threat this tick; in
+                // APPROACH/STRIKE/RECOVER the handler already acts on the new target.
+                if (threatInMelee && (state == State.SEARCH || state == State.ACQUIRE)) {
+                    setState(State.APPROACH);
+                }
+            }
+        }
+
         // ---- hunt duration failsafe ----
         int maxDur = config.combatMaxDurationSeconds.get();
         if (maxDur > 0 && huntStartTick >= 0 && (tickCount - huntStartTick) > maxDur * 20L) {
+            debug("hunt timed out");
             tell("Hunt timed out after " + maxDur + "s.");
             stop(baritone, "hunt timed out");
             return;
@@ -246,6 +302,7 @@ public final class CombatController {
         // give up after the search timeout
         int searchTimeout = config.combatSearchTimeoutSeconds.get();
         if (searchStartTick >= 0 && (tickCount - searchStartTick) > searchTimeout * 20L) {
+            debug("no target found — ending hunt");
             tell("Couldn't find any " + filter.describe() + " nearby — giving up the hunt.");
             stop(baritone, "no target found");
             return;
@@ -346,6 +403,16 @@ public final class CombatController {
             strafe(baritone, ctx);
         }
 
+        // SWARM KITE: ≥2 hostiles in melee → back off the group centroid to create
+        // space, so we don't stand and take simultaneous hits from multiple mobs.
+        // Lighter than RETREAT: we keep the target and resume striking when cooldown
+        // resets (hit → back-off → re-approach → hit cycle). Full RETREAT stays for
+        // low-HP / overwhelming numbers (the guardrails at the top of tick()).
+        if (countNearbyHostiles(ctx, MELEE_THREAT) >= SWARM_KITE_THRESHOLD) {
+            backOffFromCentroid(baritone, ctx, 4.0);
+            return;   // let the back-off step play; re-strike when cooldown resets
+        }
+
         if (cooldown <= 0) {
             setState(State.STRIKE);
             strikeJitter = jitter(0, 2);
@@ -356,7 +423,7 @@ public final class CombatController {
         // run away from the threat; resume hunting once healthy and clear
         Player player = ctx.player();
         if (player.getHealth() >= config.combatRetreatHealth.get().floatValue() + 6
-                && countAttackers(ctx) <= config.combatMaxAttackers.get()) {
+                && countNearbyHostiles(ctx, REACTION_RANGE) <= config.combatMaxAttackers.get()) {
             tell("Healthy again — re-engaging.");
             setState(State.ACQUIRE);
             return;
@@ -453,23 +520,91 @@ public final class CombatController {
                 .filter(e -> filter.predicate().test(e))
                 .filter(e -> e.distanceToSqr(player) <= SCAN_RANGE * SCAN_RANGE)
                 .map(e -> (LivingEntity) e)
-                // priority: actively-attacking-me first, then lowest HP, then nearest
+                // priority: hostile first, then lowest HP, then nearest. (The old
+                // isAttackingMe key was dead — Mob.target isn't synced to the client.)
                 .min(Comparator
-                        .comparingInt((LivingEntity e) -> isAttackingMe(e, player) ? 0 : 1)
+                        .comparingInt((LivingEntity e) -> isHostile(e) ? 0 : 1)
                         .thenComparingDouble(LivingEntity::getHealth)
                         .thenComparingDouble(e -> e.distanceToSqr(player)))
                 .orElse(null);
     }
 
-    private boolean isAttackingMe(LivingEntity e, Player player) {
-        return e instanceof Mob mob && mob.getTarget() == player;
+    /**
+     * Client-side hostile check. NOT getTarget()-based: {@code Mob.target} is set
+     * server-side by mob AI and is never synced to the client, so
+     * {@code mob.getTarget()} is {@code null} on the client. Detecting threats by
+     * hostile type + proximity (done in {@link #nearestHostile} /
+     * {@link #countNearbyHostiles}) is the reliable client-side signal.
+     *
+     * <p>{@code Monster} covers Zombie/Husk/Drowned, Skeleton variants, Creeper,
+     * Spider, EnderMan, Witch, Blaze, etc. {@code Slime} and {@code Phantom} are
+     * hostile but extend {@code Mob} directly (not {@code Monster}), so they're
+     * listed explicitly. Known limitation: a <i>neutral</i> EnderMan within melee
+     * range is treated as a threat (and will be hit, provoking it) — acceptable for
+     * now; an enderman &lt;2.5 blocks away is usually already aggro'd.
+     */
+    private static boolean isHostile(Entity e) {
+        return e instanceof net.minecraft.world.entity.monster.Monster
+                || e instanceof net.minecraft.world.entity.monster.Slime
+                || e instanceof net.minecraft.world.entity.monster.Phantom;
     }
 
-    private int countAttackers(IPlayerContext ctx) {
+    /** The nearest hostile within {@code range} of the player, or null. */
+    private LivingEntity nearestHostile(IPlayerContext ctx, double range) {
         Player player = ctx.player();
+        if (player == null) return null;
+        double rs = range * range;
+        return ctx.entitiesStream()
+                .filter(e -> e instanceof LivingEntity && e.isAlive() && e != player)
+                .filter(e -> !(vesselMode && e instanceof Player))
+                .filter(CombatController::isHostile)
+                .filter(e -> e.distanceToSqr(player) <= rs)
+                .min(Comparator.comparingDouble(e -> e.distanceToSqr(player)))
+                .map(e -> (LivingEntity) e)
+                .orElse(null);
+    }
+
+    /** Count hostiles within {@code range} of the player. Replaces the dead countAttackers. */
+    private int countNearbyHostiles(IPlayerContext ctx, double range) {
+        Player player = ctx.player();
+        if (player == null) return 0;
+        double rs = range * range;
         return (int) ctx.entitiesStream()
-                .filter(e -> e instanceof Mob mob && mob.getTarget() == player)
+                .filter(e -> e instanceof LivingEntity && e.isAlive() && e != player)
+                .filter(e -> !(vesselMode && e instanceof Player))
+                .filter(CombatController::isHostile)
+                .filter(e -> e.distanceToSqr(player) <= rs)
                 .count();
+    }
+
+    /**
+     * Back away from the centroid of all nearby hostiles (multi-mob spacing), not
+     * just {@code target}. Used by the swarm kite in {@link #doRecover}: when ≥2
+     * hostiles are in melee, retreating from the group centroid opens space from
+     * the whole pack rather than one mob. Falls back to single-target
+     * {@link #backOff} if only one hostile is near.
+     */
+    private void backOffFromCentroid(IBaritone baritone, IPlayerContext ctx, double distance) {
+        Player player = ctx.player();
+        if (player == null) return;
+        double sumX = 0, sumY = 0, sumZ = 0, n = 0;
+        double rs = REACTION_RANGE * REACTION_RANGE;
+        for (Entity e : ctx.entitiesStream().toList()) {
+            if (!(e instanceof LivingEntity) || !e.isAlive() || e == player) continue;
+            if (vesselMode && e instanceof Player) continue;
+            if (!isHostile(e)) continue;
+            if (e.distanceToSqr(player) > rs) continue;
+            sumX += e.getX(); sumY += e.getY(); sumZ += e.getZ(); n++;
+        }
+        if (n == 0) {
+            if (target != null) backOff(baritone, ctx, distance);
+            return;
+        }
+        Vec3 centroid = new Vec3(sumX / n, sumY / n, sumZ / n);
+        Vec3 away = player.position().subtract(centroid);
+        if (away.lengthSqr() < 1.0e-4) return; // standing on the centroid; no direction to pick
+        BlockPos retreatPos = BlockPos.containing(player.position().add(away.normalize().scale(distance)));
+        baritone.getCustomGoalProcess().setGoalAndPath(new GoalNear(retreatPos, 1));
     }
 
     /** Alive, not removed, still in the world, and within pursue range. */

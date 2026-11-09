@@ -68,6 +68,10 @@ public final class ArionPerception {
         // nearby entities, nearest first
         List<Entity> near = ctx.entitiesStream()
                 .filter(e -> e != player && e instanceof LivingEntity)
+                // When the vessel's Baritone is bound, ctx.player() is the vessel shadow and the
+                // vessel's own RemotePlayer is a second entity (same body) near it. The shadow has
+                // no usable GameProfile name, so filter by the vessel's UUID/name, not selfName.
+                .filter(e -> !isSelfOrVessel(e, player))
                 .filter(e -> e.distanceToSqr(player) <= SCAN_RADIUS * SCAN_RADIUS)
                 .sorted(Comparator.comparingDouble(e -> e.distanceToSqr(player)))
                 .limit(12)
@@ -108,6 +112,25 @@ public final class ArionPerception {
 
     private static String fmt(Vec3 v) {
         return String.format("%d %d %d", (int) v.x, (int) v.y, (int) v.z);
+    }
+
+    /**
+     * True for the context player itself or the vessel's own client entity. The vessel shadow is a
+     * {@code LocalPlayer} with no usable profile name, so name comparison alone misses its remote
+     * counterpart; matching the vessel UUID is reliable.
+     */
+    public static boolean isSelfOrVessel(Entity e, Player self) {
+        if (e == null || self == null) return false;
+        if (e == self) return true;
+        if (!(e instanceof Player other)) return false;
+        if (other.getName().getString().equals(self.getName().getString())) return true;
+        var vm = arion.Arion.vessels();
+        if (vm != null) {
+            if (vm.vesselUuid() != null && other.getUUID().equals(vm.vesselUuid())) return true;
+            String name = vm.vesselName();
+            if (name != null && other.getName().getString().equals(name)) return true;
+        }
+        return false;
     }
 
     /** Distance in whole blocks from the player to a position, or -1 if unavailable. */

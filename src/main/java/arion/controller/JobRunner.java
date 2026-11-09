@@ -22,10 +22,12 @@ final class JobRunner {
     private JobRunner() {}
 
     static void start(Job job, IBaritone baritone) {
+        arion.ArionLog.debug("job start: " + job.label());
         job.start(baritone);
     }
 
     static void cancel(Job job, IBaritone baritone) {
+        arion.ArionLog.debug("job cancel: " + job.label());
         job.cancel(baritone);
     }
 }

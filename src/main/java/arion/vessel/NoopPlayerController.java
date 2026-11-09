@@ -15,6 +15,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.level.GameType;
@@ -34,6 +35,12 @@ import net.minecraft.world.phys.BlockHitResult;
  *
  * This is the core of the vessel's packet-safety: even if a Baritone process decides
  * to break or place a block, nothing reaches the server.
+ *
+ * <p><b>Combat:</b> {@link #attack(Player, Entity)} and {@link #releaseUsingItem(Player)}
+ * are hard no-ops here for the same reason — a client-only ghost must never send an
+ * attack/interact packet under the host's account. The live server-side vessel uses
+ * {@link VesselServerPlayerController}, which dispatches those actions to its own
+ * server-authoritative body instead.
  */
 public final class NoopPlayerController implements IPlayerController {
 
@@ -68,6 +75,22 @@ public final class NoopPlayerController implements IPlayerController {
     public InteractionResult processRightClick(LocalPlayer player, Level level, InteractionHand hand) {
         return InteractionResult.PASS;
     }
+
+    /**
+     * Never attack. The ghost has no server-side body and no network connection, so an
+     * attack here would either be a silent local no-op or (worse, if ever wired to
+     * {@code mc.gameMode}) a real packet under the host's account. Combat for the
+     * server-side vessel is bridged by {@link VesselServerPlayerController#attack}.
+     */
+    @Override
+    public void attack(Player player, Entity target) { /* no-op */ }
+
+    /**
+     * Never release an item either — releasing a bow/shield on the ghost would need a
+     * serverbound packet, which this controller must never emit.
+     */
+    @Override
+    public void releaseUsingItem(Player player) { /* no-op */ }
 
     @Override
     public boolean clickBlock(BlockPos pos, Direction side) { return false; }

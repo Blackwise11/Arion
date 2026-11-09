@@ -116,8 +116,12 @@ public final class Jobs {
         @Override protected boolean baritoneActive(IBaritone b) {
             return b.getMineProcess().isActive();
         }
-    }
 
+        /** MineProcess blacklists unreachable targets and retries; one calc failure is not fatal. */
+        @Override boolean calcFailureIsFatal() {
+            return false;
+        }
+    }
     /** Explore outward from the current position. */
     public static final class Explore extends Job {
         public Explore() {
@@ -141,6 +145,11 @@ public final class Jobs {
 
         @Override protected boolean baritoneActive(IBaritone b) {
             return b.getExploreProcess().isActive();
+        }
+
+        /** ExploreProcess handles calc failures by re-planning; not fatal. */
+        @Override boolean calcFailureIsFatal() {
+            return false;
         }
     }
 
@@ -261,8 +270,13 @@ public final class Jobs {
         private final String itemName; // empty = any dropped item
 
         public Pickup(String itemName) {
+            this(itemName, 20 * 60 * 5);
+        }
+
+        /** Short-timeout variant for the post-mining drop sweep. */
+        public Pickup(String itemName, int timeoutTicks) {
             super("pickup" + (itemName.isBlank() ? "" : " " + itemName),
-                    /*timeout*/ 20 * 60 * 5, /*stall*/ 200);
+                    /*timeout*/ timeoutTicks, /*stall*/ 200);
             this.itemName = itemName;
         }
 
@@ -288,6 +302,11 @@ public final class Jobs {
 
         @Override protected boolean baritoneActive(IBaritone b) {
             return b.getFollowProcess().isActive();
+        }
+
+        /** FollowProcess re-paths toward moving items; a calc failure is not fatal. */
+        @Override boolean calcFailureIsFatal() {
+            return false;
         }
     }
 

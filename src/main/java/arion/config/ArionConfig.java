@@ -39,6 +39,8 @@ public final class ArionConfig {
     public final ModConfigSpec.BooleanValue debugMode;
     public final ModConfigSpec.IntValue maxContextTurns;
     public final ModConfigSpec.IntValue plannerTimeoutSeconds;
+    public final ModConfigSpec.BooleanValue mineCollectDrops;
+    public final ModConfigSpec.IntValue mineDropLoiterMs;
 
     // ---- survival ----
     public final ModConfigSpec.DoubleValue eatBelowFood;
@@ -51,6 +53,10 @@ public final class ArionConfig {
     public final ModConfigSpec.BooleanValue combatHumanizeAim;
     public final ModConfigSpec.IntValue combatSearchTimeoutSeconds;
     public final ModConfigSpec.IntValue combatMaxDurationSeconds;
+    public final ModConfigSpec.BooleanValue vesselAutoDefend;
+    public final ModConfigSpec.BooleanValue autoShield;
+    public final ModConfigSpec.DoubleValue shieldRange;
+    public final ModConfigSpec.IntValue shieldHoldTicks;
 
     // ---- features (extended action verbs) ----
     public final ModConfigSpec.BooleanValue extendedVerbs;
@@ -61,6 +67,17 @@ public final class ArionConfig {
     public final ModConfigSpec.BooleanValue vesselEnabled;
     public final ModConfigSpec.BooleanValue vesselBaritoneOnServers;
     public final ModConfigSpec.BooleanValue vesselCombat;
+
+    // ---- crafting (M3) ----
+    public final ModConfigSpec.BooleanValue craftEnabled;
+    public final ModConfigSpec.BooleanValue craftPlaceStations;
+
+    // ---- laya (System 1 decision engine) ----
+    public final ModConfigSpec.BooleanValue layaEnabled;
+    public final ModConfigSpec.ConfigValue<String> layaBaseUrl;
+    public final ModConfigSpec.IntValue layaTimeoutSeconds;
+    public final ModConfigSpec.IntValue layaIntervalTicks;
+    public final ModConfigSpec.DoubleValue layaMinConfidence;
 
     // ---- voice (STT / TTS) ----
     public final ModConfigSpec.BooleanValue voiceEnabled;
@@ -114,6 +131,15 @@ public final class ArionConfig {
                 .defineInRange("maxContextTurns", 12, 0, 100);
         plannerTimeoutSeconds = b.comment("How long to wait for a planner response before giving up (local LLMs are slow).")
                 .defineInRange("plannerTimeoutSeconds", 30, 2, 300);
+        mineCollectDrops = b.comment(
+                        "While mining, make Baritone walk onto each mined block so its drops are collected",
+                        "(sets Baritone cancelOnGoalInvalidation=false), and sweep nearby drops after the action.",
+                        "Turn off to restore Baritone's faster mine-and-move-on behavior.")
+                .define("mineCollectDrops", true);
+        mineDropLoiterMs = b.comment(
+                        "How long Baritone waits after breaking a block for its drop to appear (milliseconds).",
+                        "Only applied when mineCollectDrops=true.")
+                .defineInRange("mineDropLoiterMs", 500, 0, 5000);
         b.pop();
 
         b.push("survival");
@@ -136,6 +162,22 @@ public final class ArionConfig {
                 .defineInRange("combatSearchTimeoutSeconds", 60, 5, 600);
         combatMaxDurationSeconds = b.comment("Hard cap on a single hunt. 0 = no cap. After this the hunt auto-stops.")
                 .defineInRange("combatMaxDurationSeconds", 300, 0, 3600);
+        vesselAutoDefend = b.comment(
+                        "Hand the vessel's melee defence to Baritone's CombatProcess (AutoDefendMode.ALWAYS).",
+                        "CombatProcess owns the real attacks and the shield reflex (combatUseShield, including",
+                        "predictive melee blocks); it freezes the running task while it fights and resumes it.",
+                        "Restored to the previous mode when the vessel's Baritone is unbound.")
+                .define("vesselAutoDefend", true);
+        autoShield = b.comment(
+                        "Automatically raise an offhand shield when a projectile is predicted to hit (M4 threat engine).",
+                        "Layer 0 reflex, no LLM. 'ai shield on|off' toggles it at runtime.")
+                .define("autoShield", true);
+        shieldRange = b.comment("Scan radius (blocks) for incoming projectiles. A full-charge arrow flies ~3 blocks/tick,",
+                        "and vanilla needs blockDelayTicks (5) before the block is effective, so this must",
+                        "cover well over 15 blocks of flight: 48 blocks ~= 16 ticks of lead.")
+                .defineInRange("shieldRange", 48.0, 8.0, 96.0);
+        shieldHoldTicks = b.comment("Keep the shield raised this many ticks after the last threat disappears.")
+                .defineInRange("shieldHoldTicks", 10, 0, 60);
         b.pop();
 
         b.push("features");
@@ -163,6 +205,41 @@ public final class ArionConfig {
                         "Currently no effect on the server-side vessel. (Was: packet-safe body-block hunting for the",
                         "legacy client-only vessel — superseded by real server-side combat in Phase D.)")
                 .define("vesselCombat", true);
+        b.pop();
+
+        b.push("crafting");
+        craftEnabled = b.comment(
+                        "Let Arion's macro plans craft and smelt items (M3). When false, craft/smelt steps re-plan.",
+                        "The engine reads the server's real recipe manager, consumes the exact ingredients, and",
+                        "places a crafting table/furnace when a 3x3 recipe or smelting needs one.")
+                .define("craftEnabled", true);
+        craftPlaceStations = b.comment(
+                        "Allow placing a crafting table/furnace from the body's inventory when none is nearby.",
+                        "Turn off to require an existing station within 4 blocks.")
+                .define("craftPlaceStations", true);
+        b.pop();
+
+        b.push("laya");
+        layaEnabled = b.comment(
+                        "Enable the Laya System 1 loop. While a macro plan is running ('ai plan <goal>'),",
+                        "Laya picks the atomic action (mine/combat/flee/eat/advance) every layaIntervalTicks.",
+                        "Requires the local server: laya-project\\laya_http_server.py on port 8765.")
+                .define("layaEnabled", true);
+        layaBaseUrl = b.comment("Base URL of the local Laya HTTP server (POST /decide, GET /health).")
+                .define("layaBaseUrl", "http://127.0.0.1:8765");
+        layaTimeoutSeconds = b.comment(
+                        "Give up on one Laya decision after this long; the body keeps doing its current action.",
+                        "The model answers in ~30 ms once loaded, but the first request after startup can be slow.")
+                .defineInRange("layaTimeoutSeconds", 10, 1, 60);
+        layaIntervalTicks = b.comment(
+                        "Minimum ticks between micro decisions while a macro plan is active (20 ticks = 1s).",
+                        "Lower = more reactive but more GPU passes; the server serializes requests anyway.")
+                .defineInRange("layaIntervalTicks", 10, 2, 200);
+        layaMinConfidence = b.comment(
+                        "Below this action confidence, Arion ignores Laya and performs the step's natural action.",
+                        "Laya is a classifier; measured confidence on out-of-distribution states can be near random.",
+                        "0.35 keeps decisive answers while preventing an 8%-confidence 'advance' from skipping a step.")
+                .defineInRange("layaMinConfidence", 0.35, 0.0, 1.0);
         b.pop();
 
         b.push("voice");

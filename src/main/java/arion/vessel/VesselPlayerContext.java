@@ -23,11 +23,13 @@ import net.minecraft.world.phys.HitResult;
  *
  * Only the {@code baritone.api} interface is on the compile classpath (the concrete
  * {@code BaritonePlayerContext} is not), so this implements the interface directly.
- * {@code player()} returns the vessel, and position/rotation-derived defaults
- * ({@code playerFeet}, {@code playerRotations}, …) are computed from it. Everything
- * world-level (the world, the world-data cache) is delegated to the vessel's original
- * context. {@code playerController()} is a {@link NoopPlayerController} so no Baritone
- * process can emit a break/place/attack packet through it.
+ * {@code player()} returns the vessel shadow (a client {@code LocalPlayer} whose position mirrors
+ * the server vessel, so Baritone pathfinds from the vessel's real location), and
+ * position/rotation-derived defaults ({@code playerFeet}, {@code playerRotations}, …) are computed
+ * from it. Everything world-level (the world, the world-data cache) is delegated to the primary's
+ * original context. {@code playerController()} is the caller-supplied controller — for the
+ * server-side vessel this is a {@link VesselServerPlayerController} that bridges break/place to
+ * the vessel's server body, so {@code ai mine} actually mines.
  *
  * Installed onto the vessel's Baritone via {@link VesselBaritoneBinder}.
  */
@@ -35,10 +37,12 @@ public final class VesselPlayerContext implements IPlayerContext {
 
     private final LocalPlayer vessel;
     private final IPlayerContext delegate;
+    private final IPlayerController controller;
 
-    public VesselPlayerContext(LocalPlayer vessel, IPlayerContext delegate) {
+    public VesselPlayerContext(LocalPlayer vessel, IPlayerContext delegate, IPlayerController controller) {
         this.vessel = vessel;
         this.delegate = delegate;
+        this.controller = controller;
     }
 
     @Override
@@ -53,7 +57,7 @@ public final class VesselPlayerContext implements IPlayerContext {
 
     @Override
     public IPlayerController playerController() {
-        return NoopPlayerController.INSTANCE;
+        return controller;
     }
 
     @Override

@@ -69,6 +69,20 @@ public final class SurvivalManager {
         }
     }
 
+    /**
+     * Force an eat right now — the Laya "eat" action. Returns false when no edible item is
+     * held. The reflex cooldown is bypassed, but the eat itself still takes the vanilla
+     * ~32 ticks, during which Baritone holds right-click.
+     */
+    public boolean forceEat(IBaritone baritone, IPlayerContext ctx) {
+        Player player = ctx.player();
+        if (player == null) return false;
+        if (findFoodSlot(player) < 0) return false;
+        eatCooldownTicks = 0;
+        tryEat(baritone, ctx);
+        return true;
+    }
+
     /** Swap to a food item and eat it, then swap back. A pure reflex, no LLM. */
     private void tryEat(IBaritone baritone, IPlayerContext ctx) {
         Player player = ctx.player();
